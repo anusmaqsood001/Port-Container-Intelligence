@@ -271,3 +271,500 @@ class BulkPortDetector:
                 for j in range(i + 1, len(grp)):
                     if grp[i].bbox.iou(grp[j].bbox) > thresh: sup.add(j)
         return keep
+
+# ──────────────────────────────────────────────────────────────────────
+#  TRACKER
+# ──────────────────────────────────────────────────────────────────────
+class Tracker:
+    def __init__(self):
+        self.tracks = {}; self._nid = 0; self._retired = 0
+
+    def update(self, dets):
+        matched = set()
+        for tid in list(self.tracks.keys()):
+            tr = self.tracks[tid]; best_s, best_di = 0., None
+            for di, d in enumerate(dets):
+                if d.cls != tr.cls: continue
+                s = tr.bbox.iou(d.bbox)
+                if s > best_s: best_s, best_di = s, di
+            if best_s >= CFG["iou_match_thresh"] and best_di is not None:
+                d = dets[best_di]
+                tr.update(d.bbox, d.conf, d.mask)
+                matched.add(best_di)
+            else:
+                tr.missed += 1; tr.trail.append(None)
+                if tr.missed > CFG["max_age_frames"]:
+                    self._retired += 1; del self.tracks[tid]
+        for di, d in enumerate(dets):
+            if di not in matched:
+                t = Track(tid=self._nid, cls=d.cls, bbox=d.bbox,
+                          conf=d.conf, mask=d.mask)
+                t._pcx = float(d.bbox.cx); t._pcy = float(d.bbox.cy)
+                t.trail.append((d.bbox.cx, d.bbox.cy))
+                self.tracks[self._nid] = t; self._nid += 1
+        return self.tracks
+
+    @property
+    def total_processed(self): return self._retired
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  HEATMAP
+# ──────────────────────────────────────────────────────────────────────
+class Heatmap:
+    def __init__(self): self._m = None; self._cum = None
+
+    def update(self, tracks, shape):
+        h, w = shape[:2]
+        if self._m is None:
+            self._m   = np.zeros((h, w), np.float32)
+            self._cum = np.zeros((h, w), np.float32)
+        self._m *= CFG["heatmap_decay"]
+        for tr in tracks.values():
+            r = 70 if tr.cls == "Ship" else 30
+            cx, cy = tr.bbox.cx, tr.bbox.cy
+            if 0 <= cx < w and 0 <= cy < h:
+                cv2.circle(self._m,   (cx, cy), r, 1., -1)
+                cv2.circle(self._cum, (cx, cy), r, 1., -1)
+
+    def overlay(self, frame, alpha=0.14):
+        if self._m is None: return
+        norm = cv2.normalize(self._m, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        col  = cv2.applyColorMap(norm, cv2.COLORMAP_HOT)
+        mask = (norm > 20).astype(np.float32) / 255. * alpha
+        for c in range(3):
+            frame[:, :, c] = np.clip(
+                frame[:, :, c] * (1 - mask) + col[:, :, c] * mask, 0, 255
+            ).astype(np.uint8)
+
+    @property
+    def data(self): return self._cum
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  ASYNC WRITER
+# ──────────────────────────────────────────────────────────────────────
+class AsyncWriter:
+    def __init__(self, w):
+        self._w = w; self._q = deque(); self._lock = threading.Lock()
+        self._done = False
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def write(self, f):
+        with self._lock: self._q.append(f)
+
+    def _run(self):
+        while not self._done or self._q:
+            if self._q:
+                with self._lock: f = self._q.popleft()
+                self._w.write(f)
+            else: time.sleep(0.001)
+
+    def close(self): self._done = True; self._t.join(); self._w.release()
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  SEGMENTATION OVERLAY  (the colored fill like the reference image)
+# ──────────────────────────────────────────────────────────────────────
+def apply_segmentation_overlay(frame: np.ndarray, tracks: dict) -> np.ndarray:
+    """
+    Draw filled colored masks:
+      - Ship  → MAGENTA
+      - Crane → LIME GREEN
+    Water pixels are NOT colored (mask already excludes water).
+    """
+    out = frame.copy()
+    H, W = frame.shape[:2]
+
+    # Draw ships first (background layer), then cranes on top
+    for cls_order in ["Ship", "Crane"]:
+        for tr in tracks.values():
+            if tr.cls != cls_order: continue
+            if tr.mask is None:
+                # Fallback: fill bounding box
+                b = tr.bbox
+                x1 = max(0, b.x1); y1 = max(0, b.y1)
+                x2 = min(W, b.x2); y2 = min(H, b.y2)
+                roi = out[y1:y2, x1:x2]
+                color = SEG_SHIP_COLOR if tr.cls == "Ship" else SEG_CRANE_COLOR
+                alpha = CFG["seg_alpha_ship"] if tr.cls == "Ship" else CFG["seg_alpha_crane"]
+                overlay_roi = np.full_like(roi, color, dtype=np.uint8)
+                out[y1:y2, x1:x2] = cv2.addWeighted(roi, 1 - alpha, overlay_roi, alpha, 0)
+                continue
+
+            # Use the actual pixel mask
+            seg = tr.mask
+            if seg.shape[:2] != (H, W):
+                seg = cv2.resize(seg, (W, H), interpolation=cv2.INTER_NEAREST)
+            where = seg > 128
+            color = SEG_SHIP_COLOR if tr.cls == "Ship" else SEG_CRANE_COLOR
+            alpha = CFG["seg_alpha_ship"] if tr.cls == "Ship" else CFG["seg_alpha_crane"]
+            for c_idx, c_val in enumerate(color):
+                out[:, :, c_idx] = np.where(
+                    where,
+                    np.clip(frame[:, :, c_idx] * (1 - alpha) + c_val * alpha, 0, 255).astype(np.uint8),
+                    out[:, :, c_idx]
+                )
+
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  RENDERER
+# ──────────────────────────────────────────────────────────────────────
+class Renderer:
+    def __init__(self, W, H, hw):
+        self.W = W; self.H = H; self.hw = hw
+
+    @staticmethod
+    def _T(img, text, x, y, sc=0.50, col=(220, 225, 235), bold=False, shadow=True):
+        th = 2 if bold else 1
+        if shadow:
+            cv2.putText(img, text, (x + 1, y + 1), cv2.FONT_HERSHEY_SIMPLEX,
+                        sc, (0, 0, 0), th + 1, cv2.LINE_AA)
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, sc, col, th, cv2.LINE_AA)
+
+    def _draw_trails(self, frame, tracks):
+        for tr in tracks.values():
+            pts = [p for p in tr.trail if p is not None]
+            if len(pts) < 2: continue
+            col = C["crane"] if tr.cls == "Crane" else C["ship"]
+            for i in range(1, len(pts)):
+                a = i / len(pts)
+                cv2.line(frame, pts[i - 1], pts[i],
+                         tuple(int(v * a) for v in col), 1, cv2.LINE_AA)
+
+    def _draw_boxes(self, frame, tracks):
+        for tr in tracks.values():
+            b = tr.bbox
+            col = C["crane"] if tr.cls == "Crane" else C["ship"]
+            # Thin border only (fill already done by segmentation)
+            cv2.rectangle(frame, (b.x1, b.y1), (b.x2, b.y2), col, 2, cv2.LINE_AA)
+            # Corner tick marks
+            tl = min(18, b.w // 4, b.h // 4)
+            for sx, sy, dx, dy in [(b.x1, b.y1, 1, 1), (b.x2, b.y1, -1, 1),
+                                    (b.x1, b.y2, 1, -1), (b.x2, b.y2, -1, -1)]:
+                cv2.line(frame, (sx, sy), (sx + dx * tl, sy), col, 2, cv2.LINE_AA)
+                cv2.line(frame, (sx, sy), (sx, sy + dy * tl), col, 2, cv2.LINE_AA)
+            lbl = f"{tr.cls} #{tr.tid}  {tr.conf:.0%}"
+            (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
+            cv2.rectangle(frame, (b.x1, b.y1 - th - 10), (b.x1 + tw + 8, b.y1), col, -1)
+            cv2.putText(frame, lbl, (b.x1 + 4, b.y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 0, 0), 1, cv2.LINE_AA)
+
+    def _draw_hud(self, panel, tracks, tracker, fi, total):
+        panel[:] = C["bg"]; hw = self.hw
+        cv2.line(panel, (0, 0), (0, self.H), C["accent"], 3)
+
+        def T(t, x, y, sc=0.42, col=C["white"], bold=False):
+            self._T(panel, t, x, y, sc, col, bold, shadow=False)
+
+        # Header
+        cv2.rectangle(panel, (0, 0), (hw, 60), C["panel"], -1)
+        T("PORT BULK CARRIER", 8, 26, 0.56, C["accent"], True)
+        T("tubakhxn  |  v6.0  |  SEG EDITION", 8, 46, 0.30, C["grey"])
+        cv2.line(panel, (4, 60), (hw - 4, 60), C["accent"], 1)
+
+        n_crane = sum(1 for tr in tracks.values() if tr.cls == "Crane")
+        n_ship  = sum(1 for tr in tracks.values() if tr.cls == "Ship")
+
+        kpis = [
+            ("CRANES ACTIVE", str(n_crane), C["crane"]),
+            ("SHIPS VISIBLE",  str(n_ship),  C["ship"]),
+            ("TOTAL TRACKED", str(len(tracks)), C["accent"]),
+            ("RETIRED",       str(tracker.total_processed), C["green"]),
+        ]
+        cw = (hw - 14) // 2; ky = 70
+        for i, (lbl, val, col) in enumerate(kpis):
+            ox = 7 + (i % 2) * (cw); oy = ky + (i // 2) * 58
+            cv2.rectangle(panel, (ox, oy), (ox + cw - 2, oy + 52), C["dark"], -1)
+            cv2.rectangle(panel, (ox, oy), (ox + cw - 2, oy + 3), col, -1)
+            T(lbl[:14], ox + 5, oy + 20, 0.28, C["grey"])
+            T(val,      ox + 5, oy + 44, 0.70, col, True)
+
+        y = ky + 2 * 58 + 12
+        cv2.line(panel, (4, y), (hw - 4, y), (28, 32, 48), 1); y += 10
+
+        # Crane movement section
+        T("CRANE MOVEMENT", 8, y + 14, 0.42, C["accent"]); y += 22
+        shown = 0
+        for tr in [t for t in tracks.values() if t.cls == "Crane"][:5]:
+            spd = math.hypot(tr.velocity[0], tr.velocity[1])
+            mov = "ACTIVE" if spd > 0.5 else "STATIC"
+            T(f"  #{tr.tid}: {mov} ({spd:.1f}px/f)", 8, y + 14,
+              0.36, C["green"] if spd > 0.5 else C["grey"])
+            y += 18; shown += 1
+        if shown == 0:
+            T("  None detected", 8, y + 14, 0.36, C["grey"]); y += 18
+
+        cv2.line(panel, (4, y + 4), (hw - 4, y + 4), (28, 32, 48), 1); y += 14
+
+        # Ship section
+        T("SHIP STATUS", 8, y + 14, 0.42, C["accent"]); y += 22
+        shown = 0
+        for tr in [t for t in tracks.values() if t.cls == "Ship"][:3]:
+            T(f"  #{tr.tid}: {tr.bbox.area / 1000.:.0f}k px area",
+              8, y + 14, 0.36, C["ship"])
+            y += 18; shown += 1
+        if shown == 0:
+            T("  None detected", 8, y + 14, 0.36, C["grey"]); y += 18
+
+        cv2.line(panel, (4, y + 4), (hw - 4, y + 4), (28, 32, 48), 1); y += 14
+
+        # Loading status
+        T("LOADING STATUS", 8, y + 14, 0.42, C["accent"]); y += 22
+        if n_crane > 0 and n_ship > 0:   status, sc = "LOADING IN PROGRESS", C["green"]
+        elif n_crane > 0:                 status, sc = "CRANES STANDBY",       C["amber"]
+        elif n_ship > 0:                  status, sc = "SHIP DOCKED",          C["ship"]
+        else:                             status, sc = "SCANNING...",           C["grey"]
+        cv2.rectangle(panel, (8, y), (hw - 8, y + 28), C["dark"], -1)
+        cv2.rectangle(panel, (8, y), (hw - 8, y + 28), sc, 2)
+        (tw, _), _ = cv2.getTextSize(status, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
+        T(status, hw // 2 - tw // 2, y + 20, 0.44, sc, True); y += 38
+
+        cv2.line(panel, (4, y + 4), (hw - 4, y + 4), (28, 32, 48), 1); y += 14
+
+        # Legend with colored squares
+        T("LEGEND", 8, y + 14, 0.42, C["accent"]); y += 22
+        cv2.rectangle(panel, (10, y), (30, y + 14), C["crane"], -1)
+        T("Ship Crane / Boom", 34, y + 13, 0.37, C["crane"]); y += 22
+        cv2.rectangle(panel, (10, y), (30, y + 14), C["ship"], -1)
+        T("Container Ship",   34, y + 13, 0.37, C["ship"]); y += 22
+        cv2.rectangle(panel, (10, y), (30, y + 14), (100, 80, 60), -1)
+        T("Water (no color)", 34, y + 13, 0.37, C["grey"]); y += 22
+
+        # Progress bar at bottom
+        prog = fi / max(1, total)
+        bar_y = self.H - 30
+        cv2.rectangle(panel, (4, bar_y), (hw - 4, bar_y + 14), C["dark"], -1)
+        bar_fill = int(4 + (hw - 8) * prog)
+        cv2.rectangle(panel, (4, bar_y), (bar_fill, bar_y + 14), C["accent"], -1)
+        T(f"Frame {fi}/{total}  {prog * 100:.1f}%", 8, self.H - 4, 0.32, C["grey"])
+
+    def render(self, frame, tracks, heatmap, tracker, fi, total, is_kf):
+        H, W = frame.shape[:2]; hw = self.hw
+        canvas = np.zeros((H, W + hw, 3), np.uint8)
+
+        # 1. Apply segmentation colored overlay to main frame area
+        seg_frame = apply_segmentation_overlay(frame, tracks)
+        canvas[:, :W] = seg_frame
+        main = canvas[:, :W]
+
+        # 2. Subtle heatmap on top
+        heatmap.overlay(main, alpha=0.12)
+
+        # 3. Trails and boxes
+        if is_kf: self._draw_trails(main, tracks)
+        self._draw_boxes(main, tracks)
+
+        # 4. Mini counter overlay (top-left)
+        n_crane = sum(1 for t in tracks.values() if t.cls == "Crane")
+        n_ship  = sum(1 for t in tracks.values() if t.cls == "Ship")
+        lines   = [(f"Cranes : {n_crane}", C["crane"]),
+                   (f"Ships  : {n_ship}",  C["ship"])]
+        bh = len(lines) * 28 + 12
+        cv2.rectangle(main, (0, 0), (240, bh), (0, 0, 0), -1)
+        cv2.line(main, (0, bh), (240, bh), C["accent"], 2)
+        yt = 26
+        for txt, col in lines:
+            self._T(main, txt, 10, yt, 0.54, col, bold=True, shadow=True)
+            yt += 28
+
+        # 5. Separator line + HUD panel
+        cv2.line(canvas, (W, 0), (W, H), C["accent"], 2)
+        self._draw_hud(canvas[:, W:], tracks, tracker, fi, total)
+        return canvas
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  DASHBOARD
+# ──────────────────────────────────────────────────────────────────────
+def generate_dashboard(history, heatmap_data, out):
+    print("\n[DASHBOARD] Generating ...")
+    F = list(range(len(history)))
+    BG   = "#07090f"; PAN = "#0d1018"; ACC = "#00c8ff"
+    MGT  = "#c832c8"; LGN = "#32f032"; TXT = "#c8d0dc"; GRID = "#1a1e2a"
+
+    fig = plt.figure(figsize=(20, 10), facecolor=BG)
+    fig.suptitle(
+        "PORT BULK CARRIER INTELLIGENCE v6.0  —  OPERATIONS DASHBOARD",
+        color=ACC, fontsize=16, fontweight="bold", y=0.98, fontfamily="monospace"
+    )
+    gs = fig.add_gridspec(2, 3, hspace=0.50, wspace=0.38,
+                          left=0.06, right=0.97, top=0.93, bottom=0.06)
+
+    def sax(ax, title=""):
+        ax.set_facecolor(PAN)
+        for sp in ax.spines.values(): sp.set_color(GRID)
+        ax.tick_params(colors=TXT, labelsize=8)
+        if title: ax.set_title(title, color=ACC, fontsize=10,
+                               fontfamily="monospace", pad=6)
+
+    crane_t = [h["n_crane"] for h in history]
+    ship_t  = [h["n_ship"]  for h in history]
+
+    ax = fig.add_subplot(gs[0, :2]); sax(ax, "Detections Over Time")
+    if F:
+        ax.fill_between(F, crane_t, alpha=.28, color=LGN, label="Cranes")
+        ax.fill_between(F, ship_t,  alpha=.28, color=MGT, label="Ships")
+        ax.plot(F, crane_t, color=LGN, lw=1.8)
+        ax.plot(F, ship_t,  color=MGT, lw=1.8)
+    ax.legend(facecolor=PAN, edgecolor=GRID, labelcolor=TXT, fontsize=9)
+    ax.set_xlabel("Frame", color=TXT, fontsize=8)
+    ax.yaxis.grid(True, color=GRID, alpha=.5)
+
+    ax = fig.add_subplot(gs[0, 2]); sax(ax, "Activity Heatmap")
+    if heatmap_data is not None and heatmap_data.max() > 0:
+        ax.imshow(cv2.resize(heatmap_data, (480, 270)), cmap="hot",
+                  interpolation="bilinear", aspect="auto")
+        ax.set_xticks([]); ax.set_yticks([])
+    else:
+        ax.text(.5, .5, "No data", color=TXT, ha="center", va="center",
+                transform=ax.transAxes)
+
+    ax = fig.add_subplot(gs[1, :2]); sax(ax, "Object Count Distribution")
+    total_t = [h["n_total"] for h in history]
+    if total_t:
+        n, bins, patches = ax.hist(total_t, bins=20, edgecolor=BG, alpha=.85)
+        for patch, left in zip(patches, bins[:-1]):
+            patch.set_facecolor(LGN if left < 4 else MGT)
+    ax.set_xlabel("Objects", color=TXT, fontsize=8)
+    ax.yaxis.grid(True, color=GRID, alpha=.5)
+
+    ax = fig.add_subplot(gs[1, 2]); sax(ax, "Detection Split")
+    totc = sum(crane_t); tots = sum(ship_t)
+    if totc + tots > 0:
+        ax.pie([totc, tots], labels=["Cranes", "Ships"],
+               colors=[LGN, MGT], autopct="%1.0f%%", startangle=90,
+               textprops={"color": TXT, "fontsize": 9},
+               wedgeprops={"edgecolor": BG, "linewidth": 2})
+    else:
+        ax.text(.5, .5, "No data", color=TXT, ha="center", va="center",
+                transform=ax.transAxes)
+
+    plt.savefig(out, dpi=140, bbox_inches="tight", facecolor=BG)
+    plt.close(); print(f"  [OK] Dashboard -> {out}")
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  VIDEO WRITER
+# ──────────────────────────────────────────────────────────────────────
+def get_writer(path, fps, size):
+    for fc in ["H264", "avc1", "h264"]:
+        try:
+            w = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fc), fps, size)
+            if w.isOpened():
+                print(f"  [CODEC] {fc} -> {path}"); return w, path
+            w.release()
+        except: pass
+    avi_path = path.replace(".mp4", ".avi")
+    try:
+        w = cv2.VideoWriter(avi_path, cv2.VideoWriter_fourcc(*"XVID"), fps, size)
+        if w.isOpened():
+            print(f"  [CODEC] XVID -> {avi_path}  (open with VLC if WMP fails)")
+            return w, avi_path
+        w.release()
+    except: pass
+    w = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
+    print(f"  [CODEC] mp4v -> {path}  (open with VLC)")
+    return w, path
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  FIND VIDEO
+# ──────────────────────────────────────────────────────────────────────
+def find_video() -> str:
+    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]): return sys.argv[1]
+    for pat in ["port*.mp4", "harbor*.mp4", "ship*.mp4", "bulk*.mp4",
+                "*.mp4", "*.avi", "*.mov", "*.mkv"]:
+        for f in glob.glob(pat):
+            if "output" not in f.lower() and "dashboard" not in f.lower() \
+               and os.path.isfile(f):
+                return f
+    return ""
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  MAIN
+# ──────────────────────────────────────────────────────────────────────
+def run():
+    import shutil
+    inp = find_video()
+    if not inp:
+        print("\n[ERROR] No video found.")
+        print("  Usage: python port_bulk_carrier_v6.py your_video.mp4")
+        sys.exit(1)
+    print(f"\n[VIDEO] Input -> {inp}")
+
+    cap = cv2.VideoCapture(inp)
+    if not cap.isOpened():
+        print(f"[ERROR] Cannot open {inp}"); sys.exit(1)
+
+    W     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps   = cap.get(cv2.CAP_PROP_FPS) or 25.
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"[VIDEO] {W}x{H}  {fps:.1f}fps  {total} frames  ({total/fps:.1f}s)")
+
+    os.makedirs(CFG["output_dir"], exist_ok=True)
+    hw       = CFG["hud_width"]
+    out_path = os.path.join(CFG["output_dir"], CFG["output_video"])
+    raw_w, actual_path = get_writer(out_path, fps, (W + hw, H))
+    writer   = AsyncWriter(raw_w)
+
+    detector = BulkPortDetector(W, H)
+    tracker  = Tracker()
+    heatmap  = Heatmap()
+    renderer = Renderer(W, H, hw)
+
+    history      = []
+    detect_every = CFG["detect_every"]
+    last_tracks  = {}
+
+    print(f"\n[PROCESS] Analysing {total} frames ...")
+    print(f"  detect_every={detect_every}  scale={CFG['detect_scale']}")
+    print(f"  Segmentation: Ship=MAGENTA  Crane=LIME  Water=EXCLUDED")
+    t0 = time.time()
+
+    for fi in tqdm(range(total), desc="  Frames", ncols=72, unit="fr"):
+        ret, frame = cap.read()
+        if not ret: break
+        is_kf = (fi % detect_every == 0)
+        if is_kf:
+            dets        = detector.detect(frame)
+            last_tracks = tracker.update(dets)
+            heatmap.update(last_tracks, frame.shape)
+        canvas = renderer.render(frame, last_tracks, heatmap,
+                                 tracker, fi, total, is_kf)
+        writer.write(canvas)
+        if is_kf:
+            n_crane = sum(1 for t in last_tracks.values() if t.cls == "Crane")
+            n_ship  = sum(1 for t in last_tracks.values() if t.cls == "Ship")
+            history.append({"n_crane": n_crane, "n_ship": n_ship,
+                            "n_total": len(last_tracks)})
+
+    elapsed = time.time() - t0
+    cap.release(); writer.close()
+
+    final_name = os.path.basename(actual_path)
+    shutil.copy(actual_path, final_name)
+    print(f"\n  [OK] Video -> {final_name}")
+    print(f"       {total} frames in {elapsed:.1f}s  ({total/max(elapsed, 1e-6):.1f} fps)")
+
+    dash_path = os.path.join(CFG["output_dir"], CFG["output_dashboard"])
+    generate_dashboard(history, heatmap.data, dash_path)
+    shutil.copy(dash_path, CFG["output_dashboard"])
+
+    print("\n" + "=" * 70)
+    print("  DONE  --  PORT BULK CARRIER INTELLIGENCE v6.0")
+    print(f"  Video     -> {final_name}")
+    print(f"  Dashboard -> {CFG['output_dashboard']}")
+    if final_name.endswith(".avi"):
+        print("  NOTE: .avi output — open with VLC or Windows Media Player")
+    print(f"  Speed     -> {total/max(elapsed, 1e-6):.1f} fps  ({elapsed:.1f}s)")
+    print("=" * 70 + "\n")
+
+
+if __name__ == "__main__":
+    run()
